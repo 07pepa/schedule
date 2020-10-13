@@ -83,6 +83,117 @@ How to continuously run the scheduler without blocking the main thread?
 
 Run the scheduler in a separate thread. Mrwhick wrote up a nice solution in to this problem `here <https://github.com/mrhwick/schedule/blob/master/schedule/__init__.py>`__ (look for ``run_continuously()``)
 
+Does schedule support corutines?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Vanilla schedule technicly does support corutines.
+It is supported (but discouraged) in way that in job you can create eventloop for running corutines run them and lose it on end of job 
+
+Better solution is to run you corutines as tasks on scheduler loop that is already running as corutine as shown in example.
+
+.. code-block:: python
+    import asyncio
+    import schedule
+    import functools
+
+    def asCoroTask(func,name=None):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            asyncio.create_task(func(*args,**kwargs))
+        return wrapper
+
+
+    @asCoroTask
+    async def longRunningTask():
+        print("starting long running io bound task")
+        await asyncio.sleep(5) #pretend something usefull
+        print("task done")
+
+    async def corutineLoop():
+        while 1:
+            schedule.run_pending()
+            print("running")
+            await asyncio.sleep(1)
+
+
+    schedule.every(1).seconds.do(longRunningTask)
+
+    asyncio.run(corutineLoop())
+
+When to use corutines as jobs?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- when you are using asyncio frameworks and want to exploit asyncio cooperative multitasking with.
+- when you need handle os siglals and terminate scheduler loop immediately without waiting for sleep/wait to finished
+
+note you code/including signal handlers may still delay other jobs by blocking, long runing and cpu bound, jobs
+it may be sidesteped by running your tasks in thread/executor example:
+https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.loop.run_in_executor
+
+Can scheduler loop delay handling signals if executed in main thread?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This referes to os signals like sigkill https://docs.python.org/3/library/signal.html.
+
+Answer is it depends when signal is invoked. Worst case is durring sleep/wait between runs of schedule.run_pending().
+Othervise execution of python would progress and virtual machine would notice flag that indicates it should execute signal handler and 
+it would execute it. This also closely depends on what is used for timing runs of schedule.run_pending().
+
+There are 3 for timing runs:
+1) time.sleep - handler of signal is executed immediately but also time sleeps continue sleeping for remaining time
+2) threading.event.wait - wait is actively blocking any executinon until timeout expores then signal handler is runned so you can not set event from handler
+3) asyncio.wait with asyncio.Event - handler of signal is runned without regards of current wait. If handler sets event then loop terminate as soon as it is set. Example folowing code
+
+corutine based loop
+note (python will not exit untill all running corutines running threads and work submited to pool is finished)
+.. code-block:: python
+    import signal
+    import asyncio
+    import schedule
+    async def cancelOrWait(event,sleepFor=1):
+        try:
+            return await asyncio.wait_for(event.wait(), timeout=sleepFor)
+        except asyncio.TimeoutError:
+            return False
+
+    def setupEvent(*signals):
+        terminateCondition = asyncio.Event()
+
+        addSignal= None
+
+        def universalTerminator(signum):
+            print("terminating due "+str(signum))
+            terminateCondition.set()
+        
+        from sys import platform
+
+        if platform == "win32":
+            def winAdd(signum):
+                signal.signal(signum,lambda sig,frame: universalTerminator(signum))
+
+            addSignal=winAdd
+        else: ##needed because of https://docs.python.org/3/library/asyncio-eventloop.html#unix-signals
+            #note this may be broken on non unix os like cygwin, riscos, atheos etc. Try use other variant
+            loop=asyncio.get_running_loop()
+            def unixAdd(signum):
+                loop.add_signal_handler(signum, lambda: universalTerminator(signum))
+            addSignal= unixAdd
+        
+        for sig in signals:
+            addSignal(sig)
+        
+        return terminateCondition
+
+    async def interuptableLoop(interuptEvent):
+        while not await cancelOrWait(interuptEvent):
+            print("runnining pending")
+            schedule.run_pending()
+        print("loop exited")
+
+    async def main():
+    await interuptableLoop(setupEvent(signal.SIGINT,signal.SIGABRT))
+
+    asyncio.run(main())
+
 Does schedule support timezones?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -216,7 +327,7 @@ How can I pass arguments to the job function?
         print('Hello', name)
 
     schedule.every(2).seconds.do(greet, name='Alice')
-    schedule.every(4).seconds.do(greet, name='Bob')    
+    schedule.every(4).seconds.do(greet, name='Bob')
 
 How can I make sure long-running jobs are always executed on time?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
